@@ -203,6 +203,19 @@ static constexpr size_t ESP_USB_HOST_VENDOR_WRITE_QUEUE_MAX_DEPTH = 8;
 // Same bound for serialWriteQueueBegin(depth, ...). The CDC data OUT endpoint is
 // bulk as well, so the queue has the same shape as the vendor one.
 static constexpr size_t ESP_USB_HOST_SERIAL_WRITE_QUEUE_MAX_DEPTH = 8;
+// Number of CDC/VCP bulk-IN transfers kept in flight concurrently. Each transfer
+// remains one endpoint max-packet in size so FTDI VCP status bytes stay aligned.
+static constexpr size_t ESP_USB_HOST_SERIAL_READ_QUEUE_DEPTH = 4;
+// Maximum payload submitted in one CDC/VCP bulk-OUT USB transfer.
+//
+// RT4K/FT232R testing on ESP32-S3 found an exact reliability boundary: a
+// 2047-byte USB OUT transfer is reliable, while transfers of 2048 bytes or
+// larger can complete at the USB host API yet arrive incorrectly on the UART
+// side. Keep the logical serial byte stream unchanged by splitting larger
+// writes into <=2047-byte USB transfers. USB transfer boundaries are not bytes
+// on the UART wire.
+static constexpr size_t ESP_USB_HOST_SERIAL_OUT_MAX_TRANSFER_BYTES = 2047;
+
 // How long sendSerial() waits for a free queue slot when the asynchronous queue
 // is active. Only applies off the USB client task, where waiting can progress.
 static constexpr uint32_t ESP_USB_HOST_SERIAL_WRITE_DEFAULT_TIMEOUT_MS = 1000;
@@ -1751,6 +1764,9 @@ public:
   bool serialReady(uint8_t address = ESP_USB_HOST_ANY_ADDRESS) const;
   bool setSerialBaudRate(uint32_t baud, uint8_t address = ESP_USB_HOST_ANY_ADDRESS);
   bool setSerialConfig(const EspUsbHostSerialConfig &config, uint8_t address = ESP_USB_HOST_ANY_ADDRESS);
+  // Returns the current FTDI CTS modem input. This is a synchronous USB control
+  // transfer and is currently supported for FTDI vendor-serial devices (VID 0403).
+  bool serialCts(bool *cts, uint8_t address = ESP_USB_HOST_ANY_ADDRESS);
   // Max packet size of the CDC data OUT endpoint, or 0 when no serial device is
   // ready. Needed by callers that must terminate a transfer on a packet boundary.
   uint16_t serialOutPacketSize(uint8_t address = ESP_USB_HOST_ANY_ADDRESS) const;
@@ -1791,6 +1807,7 @@ public:
   bool serialWriteFlush(uint32_t timeoutMs, uint8_t address = ESP_USB_HOST_ANY_ADDRESS);
   EspUsbHostSerialWriteStats serialWriteStats(uint8_t address = ESP_USB_HOST_ANY_ADDRESS) const;
   void serialWriteStatsReset(uint8_t address = ESP_USB_HOST_ANY_ADDRESS);
+
 
   bool midiReady(uint8_t address = ESP_USB_HOST_ANY_ADDRESS) const;
 
@@ -2513,6 +2530,7 @@ private:
   static void hidReportDescriptorTransferCallback(usb_transfer_t *transfer);
   static void outputTransferCallback(usb_transfer_t *transfer);
   static void serialOutTransferCallback(usb_transfer_t *transfer);
+  static void serialInTransferCallback(usb_transfer_t *transfer);
   static void vendorOutTransferCallback(usb_transfer_t *transfer);
 
   void taskLoop();
@@ -2928,6 +2946,13 @@ public:
   bool setConfig(const EspUsbHostSerialConfig &config);
   bool setDtr(bool enable);
   bool setRts(bool enable);
+  // Enable/disable FTDI RTS/CTS hardware flow control.
+  bool setHardwareFlowControl(bool enable);
+  // Read the FTDI CTS modem input. Returns true when the USB/control transfer succeeds.
+  // The CTS state is returned through the reference.
+  bool getCts(bool &cts) const;
+  // Convenience form: returns the CTS state; false also represents a read error.
+  bool getCts() const;
   void setAddress(uint8_t address);
   uint8_t address() const;
   void clearAddress();

@@ -4509,10 +4509,55 @@ bool EspUsbHost::sendSerial(const uint8_t *data, size_t length, uint8_t address)
   // slot only works off the USB client task, where the completions run.
   if (device->serialOutQueueActive && length <= device->serialOutBufferBytes)
   {
-    const uint32_t timeoutMs = xTaskGetCurrentTaskHandle() == clientTaskHandle_
+    const bool onClientTask = xTaskGetCurrentTaskHandle() == clientTaskHandle_;
+    const uint32_t timeoutMs = onClientTask
                                    ? 0
                                    : ESP_USB_HOST_SERIAL_WRITE_DEFAULT_TIMEOUT_MS;
-    return serialWriteAsync(data, length, timeoutMs, device->info.address);
+
+    // Keep every physical USB OUT submission strictly below 2048 bytes.
+    // The caller still supplied one continuous serial write; splitting here
+    // changes only USB transaction boundaries, not the UART byte stream.
+    //
+    // Drain each chunk before submitting the next one. This guarantees byte
+    // ordering across the split and avoids having pieces of one logical serial
+    // write concurrently in flight.
+    if (length > ESP_USB_HOST_SERIAL_OUT_MAX_TRANSFER_BYTES)
+    {
+      if (onClientTask)
+      {
+        // Completion callbacks execute on the client task, so a blocking drain
+        // here would deadlock. Fall through to the existing one-shot path rather
+        // than pretending the split was safely applied.
+        ESP_LOGW(TAG, "sendSerial() cannot synchronously split %u bytes from the USB client task",
+                 static_cast<unsigned>(length));
+      }
+      else
+      {
+        size_t offset = 0;
+        while (offset < length)
+        {
+          const size_t remaining = length - offset;
+          const size_t chunk = remaining > ESP_USB_HOST_SERIAL_OUT_MAX_TRANSFER_BYTES
+                                   ? ESP_USB_HOST_SERIAL_OUT_MAX_TRANSFER_BYTES
+                                   : remaining;
+
+          if (!serialWriteAsync(data + offset, chunk, timeoutMs, device->info.address))
+          {
+            return false;
+          }
+          if (!serialWriteFlush(ESP_USB_HOST_SERIAL_WRITE_DEFAULT_TIMEOUT_MS, device->info.address))
+          {
+            return false;
+          }
+          offset += chunk;
+        }
+        return true;
+      }
+    }
+    else
+    {
+      return serialWriteAsync(data, length, timeoutMs, device->info.address);
+    }
   }
 
   const size_t packetSize = length > device->serialOutPacketSize ? length : device->serialOutPacketSize;
@@ -4543,6 +4588,7 @@ bool EspUsbHost::sendSerial(const uint8_t *data, size_t length, uint8_t address)
     usb_host_transfer_free(transfer);
     return false;
   }
+
   return true;
 }
 
@@ -4607,6 +4653,49 @@ bool EspUsbHost::setSerialConfig(const EspUsbHostSerialConfig &config, uint8_t a
   else if (device->vendorSerialSupported)
   {
     configureVendorSerial(*device);
+  }
+  return true;
+}
+
+bool EspUsbHost::serialCts(bool *cts, uint8_t address)
+{
+  if (cts)
+  {
+    *cts = false;
+  }
+
+  // FTDI SIO_GET_MODEM_STATUS.
+  // Request: 0x05, bmRequestType: 0xC0 (vendor/device IN)
+  // Modem status low byte bit 4 (0x10) is CTS; bit 0 is reserved and normally reads 1.
+  const DeviceState *device = findSerialDevice(address);
+  if (!device || !device->handle || device->info.vid != 0x0403 ||
+      !device->vendorSerialSupported || !device->hasVendorSerialInterface)
+  {
+    return false;
+  }
+
+  uint8_t status[2] = {0, 0};
+  size_t actualLength = 0;
+
+  const bool ok = submitVendorControl(
+      *const_cast<DeviceState *>(device),
+      0xC0,                 // USB IN | vendor | device
+      0x05,                 // FTDI SIO_GET_MODEM_STATUS
+      0x0000,
+      device->vendorSerialInterfaceNumber,
+      status,
+      sizeof(status),
+      &actualLength,
+      250);
+
+  if (!ok || actualLength < 2)
+  {
+    return false;
+  }
+
+  if (cts)
+  {
+    *cts = (status[0] & 0x10) != 0;
   }
   return true;
 }
@@ -8249,41 +8338,71 @@ void EspUsbHost::handleDescriptor(uint8_t descriptorType, const uint8_t *data)
         return;
       }
 
-      EndpointState *endpoint = allocateEndpoint(*device);
-      if (!endpoint)
+      // Keep several max-packet transfers in flight. For the FTDI VCP used by
+      // U1, each USB packet carries its own 2-byte status header, so we must
+      // NOT make one large multi-packet transfer and then strip only the first
+      // two bytes. One max-packet transfer per queued URB preserves framing.
+      EndpointState *allocated[ESP_USB_HOST_SERIAL_READ_QUEUE_DEPTH] = {};
+      size_t allocatedCount = 0;
+
+      for (size_t i = 0; i < ESP_USB_HOST_SERIAL_READ_QUEUE_DEPTH; i++)
       {
-        ESP_LOGW(TAG, "No endpoint slots available");
-        setLastError(ESP_ERR_NO_MEM);
-        return;
+        EndpointState *endpoint = allocateEndpoint(*device);
+        if (!endpoint)
+        {
+          ESP_LOGW(TAG, "No endpoint slots available for serial IN queue (wanted %u)",
+                   static_cast<unsigned>(ESP_USB_HOST_SERIAL_READ_QUEUE_DEPTH));
+          setLastError(ESP_ERR_NO_MEM);
+          for (size_t j = 0; j < allocatedCount; j++)
+          {
+            if (allocated[j]->transfer)
+            {
+              usb_host_transfer_free(allocated[j]->transfer);
+            }
+            resetEndpointState(*allocated[j]);
+          }
+          return;
+        }
+
+        esp_err_t err = usb_host_transfer_alloc(ep->wMaxPacketSize, 0, &endpoint->transfer);
+        if (err != ESP_OK)
+        {
+          endpoint->inUse = false;
+          ESP_LOGW(TAG, "usb_host_transfer_alloc(serial IN) failed: %s", esp_err_to_name(err));
+          setLastError(err);
+          for (size_t j = 0; j < allocatedCount; j++)
+          {
+            if (allocated[j]->transfer)
+            {
+              usb_host_transfer_free(allocated[j]->transfer);
+            }
+            resetEndpointState(*allocated[j]);
+          }
+          return;
+        }
+
+        endpoint->address = ep->bEndpointAddress;
+        endpoint->interfaceNumber = currentInterfaceNumber_;
+        endpoint->alternate = currentInterfaceAlternate_;
+        endpoint->interfaceClass = currentInterfaceClass_;
+        endpoint->interfaceSubClass = currentInterfaceSubClass_;
+        endpoint->interfaceProtocol = currentInterfaceProtocol_;
+        endpoint->transfer->device_handle = device->handle;
+        endpoint->transfer->bEndpointAddress = ep->bEndpointAddress;
+        endpoint->transfer->callback = serialInTransferCallback;
+        endpoint->transfer->context = this;
+        endpoint->transfer->num_bytes = ep->wMaxPacketSize;
+        endpoint->resubmitPending = true;
+
+        allocated[allocatedCount++] = endpoint;
       }
 
-      esp_err_t err = usb_host_transfer_alloc(ep->wMaxPacketSize, 0, &endpoint->transfer);
-      if (err != ESP_OK)
-      {
-        endpoint->inUse = false;
-        ESP_LOGW(TAG, "usb_host_transfer_alloc(serial IN) failed: %s", esp_err_to_name(err));
-        setLastError(err);
-        return;
-      }
-
-      endpoint->address = ep->bEndpointAddress;
-      endpoint->interfaceNumber = currentInterfaceNumber_;
-      endpoint->alternate = currentInterfaceAlternate_;
-      endpoint->interfaceClass = currentInterfaceClass_;
-      endpoint->interfaceSubClass = currentInterfaceSubClass_;
-      endpoint->interfaceProtocol = currentInterfaceProtocol_;
-      endpoint->transfer->device_handle = device->handle;
-      endpoint->transfer->bEndpointAddress = ep->bEndpointAddress;
-      endpoint->transfer->callback = transferCallback;
-      endpoint->transfer->context = this;
-      endpoint->transfer->num_bytes = ep->wMaxPacketSize;
-
-      endpoint->resubmitPending = true;
-      ESP_LOGI(TAG, "%s bulk IN endpoint ready: iface=%u ep=0x%02x size=%u",
+      ESP_LOGI(TAG, "%s bulk IN endpoint ready: iface=%u ep=0x%02x size=%u queued=%u",
                currentInterfaceClass_ == USB_CLASS_CDC_DATA_VALUE ? "CDC" : vendorSerialName(device->info.vid),
-               endpoint->interfaceNumber,
-               endpoint->address,
-               ep->wMaxPacketSize);
+               currentInterfaceNumber_,
+               ep->bEndpointAddress,
+               ep->wMaxPacketSize,
+               static_cast<unsigned>(ESP_USB_HOST_SERIAL_READ_QUEUE_DEPTH));
       return;
     }
 
@@ -9539,6 +9658,73 @@ void EspUsbHost::outputTransferCallback(usb_transfer_t *transfer)
   usb_host_transfer_free(transfer);
 }
 
+void EspUsbHost::serialInTransferCallback(usb_transfer_t *transfer)
+{
+  EspUsbHost *host = static_cast<EspUsbHost *>(transfer ? transfer->context : nullptr);
+  if (!host || !transfer)
+  {
+    if (transfer)
+    {
+      usb_host_transfer_free(transfer);
+    }
+    return;
+  }
+
+  // Find the EndpointState that owns this particular RX transfer. Multiple
+  // EndpointState entries may represent the same serial endpoint; each one has
+  // its own transfer so several USB IN URBs can remain queued at once.
+  EndpointState *endpoint = nullptr;
+  for (EndpointState &candidate : host->endpoints_)
+  {
+    if (candidate.inUse && candidate.transfer == transfer)
+    {
+      endpoint = &candidate;
+      break;
+    }
+  }
+
+  if (!endpoint)
+  {
+    usb_host_transfer_free(transfer);
+    return;
+  }
+
+  endpoint->transferSubmitted = false;
+  DeviceState *device = host->findDeviceByHandle(endpoint->deviceHandle);
+
+  if (transfer->status == USB_TRANSFER_STATUS_COMPLETED &&
+      transfer->actual_num_bytes > 0 && device)
+  {
+    host->handleSerial(*endpoint, transfer->data_buffer, transfer->actual_num_bytes);
+  }
+
+  if (transfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+      transfer->status == USB_TRANSFER_STATUS_CANCELED)
+  {
+    return;
+  }
+
+  if (transfer->status != USB_TRANSFER_STATUS_COMPLETED)
+  {
+    ESP_LOGD(TAG, "serial IN transfer status=%d ep=0x%02x",
+             transfer->status, transfer->bEndpointAddress);
+    host->setLastError(ESP_FAIL);
+    endpoint->recoveryPending = true;
+    return;
+  }
+
+  // Re-submit this same max-packet transfer immediately. Keeping several of
+  // these outstanding removes the gap between one USB completion callback and
+  // the next host submission while preserving FTDI's per-packet status header.
+  if (host->running_ && endpoint->deviceHandle)
+  {
+    if (!host->submitInputTransfer(*endpoint))
+    {
+      endpoint->recoveryPending = true;
+    }
+  }
+}
+
 void EspUsbHost::serialOutTransferCallback(usb_transfer_t *transfer)
 {
   EspUsbHost *host = static_cast<EspUsbHost *>(transfer->context);
@@ -9567,6 +9753,8 @@ void EspUsbHost::serialOutTransferCallback(usb_transfer_t *transfer)
 
   if (!device)
   {
+    // A transfer that is not a member of the pooled queue is either the
+    // one-shot sendSerial() path or a pooled transfer whose queue was released.
     if (transfer->status != USB_TRANSFER_STATUS_COMPLETED)
     {
       ESP_LOGD(TAG, "serial OUT transfer status=%d ep=0x%02x",
@@ -9574,9 +9762,10 @@ void EspUsbHost::serialOutTransferCallback(usb_transfer_t *transfer)
                transfer->bEndpointAddress);
       host->setLastError(ESP_FAIL);
     }
+
     // Either a one-shot transfer, or a pooled one whose pool was already
-    // released; releaseSerialOutQueue() deliberately leaked the latter, so both
-    // are freed now that the driver is done with them.
+    // released; releaseSerialOutQueue() deliberately left the latter for this
+    // callback to free once the USB driver is finished with it.
     usb_host_transfer_free(transfer);
     return;
   }
@@ -13484,11 +13673,27 @@ void EspUsbHost::configureVendorSerial(DeviceState &device)
   {
     const uint16_t divisor = ftdiBaudDivisor(device.serialConfig.baud);
 
-    submitVendorSerialControl(VENDOR_OUT_REQUEST_TYPE, 0x00, 0x0000, device.vendorSerialInterfaceNumber, nullptr, 0, device.info.address);
-    submitVendorSerialControl(VENDOR_OUT_REQUEST_TYPE, 0x03, divisor, device.vendorSerialInterfaceNumber, nullptr, 0, device.info.address);
-    submitVendorSerialControl(VENDOR_OUT_REQUEST_TYPE, 0x04, ftdiDataCharacteristics(device.serialConfig), device.vendorSerialInterfaceNumber, nullptr, 0, device.info.address);
-    submitVendorSerialControl(VENDOR_OUT_REQUEST_TYPE, 0x02, device.serialDtr ? 0x0011 : 0x0010, device.vendorSerialInterfaceNumber, nullptr, 0, device.info.address);
-    submitVendorSerialControl(VENDOR_OUT_REQUEST_TYPE, 0x02, device.serialRts ? 0x0021 : 0x0020, device.vendorSerialInterfaceNumber, nullptr, 0, device.info.address);
+    auto submitFtdiConfig = [&](uint8_t request, uint16_t value) {
+      return submitVendorSerialControl(
+          VENDOR_OUT_REQUEST_TYPE, request, value,
+          device.vendorSerialInterfaceNumber, nullptr, 0, device.info.address);
+    };
+
+    submitFtdiConfig(0x00, 0x0000); // reset
+    submitFtdiConfig(0x03, divisor); // baud
+    submitFtdiConfig(0x04, ftdiDataCharacteristics(device.serialConfig)); // data
+    submitFtdiConfig(0x01, device.serialDtr ? 0x0101 : 0x0100); // DTR
+    submitFtdiConfig(0x01, device.serialRts ? 0x0202 : 0x0200); // RTS
+
+    // FTDI SIO_SET_FLOW_CTRL = 0x02.  For FTDI, wValue carries
+    // XON/XOFF characters while the flow-control protocol lives in the high
+    // byte of wIndex.  RTS/CTS therefore uses wValue=0 and
+    // wIndex=0x0100 | port.
+    const uint16_t flowIndex = static_cast<uint16_t>(
+        0x0100 | (device.vendorSerialInterfaceNumber & 0x00ff));
+    submitVendorSerialControl(
+        VENDOR_OUT_REQUEST_TYPE, 0x02, 0x0000, flowIndex,
+        nullptr, 0, device.info.address);
   }
   else if (device.info.vid == 0x10c4)
   {
@@ -14450,6 +14655,49 @@ bool EspUsbHostCdcSerial::setRts(bool enable)
     host_.configureVendorSerial(*device);
   }
   return true;
+}
+
+bool EspUsbHostCdcSerial::setHardwareFlowControl(bool enable)
+{
+  EspUsbHost::DeviceState *device = host_.findSerialDevice(address_);
+  if (!device || !device->vendorSerialSupported || !device->hasVendorSerialInterface ||
+      device->info.vid != 0x0403)
+  {
+    return false;
+  }
+
+  // FTDI SIO_SET_FLOW_CTRL = 0x02.
+  // wValue is 0 for hardware RTS/CTS; the protocol selector is the high byte
+  // of wIndex.  Preserve the low-byte port/interface selector.
+  const uint16_t index = static_cast<uint16_t>(
+      (enable ? 0x0100 : 0x0000) |
+      (device->vendorSerialInterfaceNumber & 0x00ff));
+  const bool ok = host_.submitVendorSerialControl(
+      VENDOR_OUT_REQUEST_TYPE,
+      0x02,
+      0x0000,
+      index,
+      nullptr,
+      0,
+      device->info.address);
+
+  return ok;
+}
+
+bool EspUsbHostCdcSerial::getCts(bool &cts) const
+{
+  cts = false;
+  return host_.serialCts(&cts, address_);
+}
+
+bool EspUsbHostCdcSerial::getCts() const
+{
+  bool cts = false;
+  if (!getCts(cts))
+  {
+    return false;
+  }
+  return cts;
 }
 
 void EspUsbHostCdcSerial::setAddress(uint8_t address)
