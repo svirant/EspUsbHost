@@ -4545,10 +4545,6 @@ bool EspUsbHost::sendSerial(const uint8_t *data, size_t length, uint8_t address)
           {
             return false;
           }
-          if (!serialWriteFlush(ESP_USB_HOST_SERIAL_WRITE_DEFAULT_TIMEOUT_MS, device->info.address))
-          {
-            return false;
-          }
           offset += chunk;
         }
         return true;

@@ -214,7 +214,7 @@ static constexpr size_t ESP_USB_HOST_SERIAL_READ_QUEUE_DEPTH = 4;
 // side. Keep the logical serial byte stream unchanged by splitting larger
 // writes into <=2047-byte USB transfers. USB transfer boundaries are not bytes
 // on the UART wire.
-static constexpr size_t ESP_USB_HOST_SERIAL_OUT_MAX_TRANSFER_BYTES = 2047;
+static constexpr size_t ESP_USB_HOST_SERIAL_OUT_MAX_TRANSFER_BYTES = 1984;
 
 // How long sendSerial() waits for a free queue slot when the asynchronous queue
 // is active. Only applies off the USB client task, where waiting can progress.
