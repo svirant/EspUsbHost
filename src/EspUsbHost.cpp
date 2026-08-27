@@ -14508,12 +14508,28 @@ bool EspUsbHostCdcSerial::setRxBufferSize(size_t size)
   rxBufferSize_ = size;
   rxHead_ = 0;
   rxTail_ = 0;
+  rxDropped_ = 0;
   return true;
 }
 
 size_t EspUsbHostCdcSerial::rxBufferSize() const
 {
   return rxBufferSize_;
+}
+
+uint32_t EspUsbHostCdcSerial::rxDropped()
+{
+  portENTER_CRITICAL(&rxMux_);
+  const uint32_t dropped = rxDropped_;
+  portEXIT_CRITICAL(&rxMux_);
+  return dropped;
+}
+
+void EspUsbHostCdcSerial::rxDroppedReset()
+{
+  portENTER_CRITICAL(&rxMux_);
+  rxDropped_ = 0;
+  portEXIT_CRITICAL(&rxMux_);
 }
 
 bool EspUsbHostCdcSerial::begin(uint32_t baud)
@@ -14526,6 +14542,7 @@ bool EspUsbHostCdcSerial::begin(uint32_t baud)
   portENTER_CRITICAL(&rxMux_);
   rxHead_ = 0;
   rxTail_ = 0;
+  rxDropped_ = 0;
   portEXIT_CRITICAL(&rxMux_);
 
   host_.attachCdcSerial(this);
@@ -14564,6 +14581,37 @@ int EspUsbHostCdcSerial::read()
   rxTail_ = nextIndex(rxTail_);
   portEXIT_CRITICAL(&rxMux_);
   return value;
+}
+
+size_t EspUsbHostCdcSerial::read(uint8_t *buffer, size_t size)
+{
+  if (!buffer || size == 0 || !rxBuffer_)
+  {
+    return 0;
+  }
+
+  portENTER_CRITICAL(&rxMux_);
+  const size_t available = rxHead_ >= rxTail_
+                               ? rxHead_ - rxTail_
+                               : rxBufferSize_ - rxTail_ + rxHead_;
+  const size_t count = size < available ? size : available;
+  const size_t first = count < (rxBufferSize_ - rxTail_)
+                           ? count
+                           : (rxBufferSize_ - rxTail_);
+
+  if (first > 0)
+  {
+    memcpy(buffer, rxBuffer_ + rxTail_, first);
+  }
+  const size_t second = count - first;
+  if (second > 0)
+  {
+    memcpy(buffer + first, rxBuffer_, second);
+  }
+
+  rxTail_ = (rxTail_ + count) % rxBufferSize_;
+  portEXIT_CRITICAL(&rxMux_);
+  return count;
 }
 
 int EspUsbHostCdcSerial::peek()
@@ -14724,6 +14772,7 @@ void EspUsbHostCdcSerial::pushData(const uint8_t *data, size_t length)
     if (next == rxTail_)
     {
       rxTail_ = nextIndex(rxTail_);
+      rxDropped_++;
     }
     rxBuffer_[rxHead_] = data[i];
     rxHead_ = next;

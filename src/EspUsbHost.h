@@ -2929,6 +2929,8 @@ public:
 
   bool setRxBufferSize(size_t size);
   size_t rxBufferSize() const;
+  uint32_t rxDropped();
+  void rxDroppedReset();
 
   bool begin(uint32_t baud = 115200);
   void end();
@@ -2936,6 +2938,7 @@ public:
 
   int available() override;
   int read() override;
+  size_t read(uint8_t *buffer, size_t size);
   int peek() override;
   void flush() override;
   size_t write(uint8_t data) override;
@@ -2973,6 +2976,7 @@ private:
   bool attached_ = false;
   size_t rxHead_ = 0;
   size_t rxTail_ = 0;
+  uint32_t rxDropped_ = 0;
   portMUX_TYPE rxMux_ = portMUX_INITIALIZER_UNLOCKED;
 };
 
