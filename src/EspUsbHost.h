@@ -126,7 +126,7 @@ static constexpr EspUsbHostListenerId ESP_USB_HOST_INVALID_LISTENER_ID = 0;
 #if defined(CONFIG_IDF_TARGET_ESP32S2)
 #define ESP_USB_HOST_MAX_DEVICES 3
 #else
-#define ESP_USB_HOST_MAX_DEVICES 8
+#define ESP_USB_HOST_MAX_DEVICES 1
 #endif
 #endif
 static constexpr size_t ESP_USB_HOST_MAX_INTERFACES = 16;
